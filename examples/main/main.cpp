@@ -517,13 +517,16 @@ int main(int argc, char ** argv) {
 
                 is_antiprompt = false;
                 // Check if each of the reverse prompts appears at the end of the output.
+                bool need_stop=false;
                 for (std::string & antiprompt : params.antiprompt) {
                     if (last_output.find(antiprompt.c_str(), last_output.length() - antiprompt.length(), antiprompt.length()) != std::string::npos) {
-                        is_interacting = true;
+                        //is_interacting = true;
+                    	need_stop=true;
                         is_antiprompt = true;
                         break;
                     }
                 }
+                if(need_stop==true&&is_interacting==false) break; // exit if not in interactive mode
             }
 
             if (n_past > 0 && is_interacting) {
