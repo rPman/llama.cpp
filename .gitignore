@@ -48,3 +48,6 @@ qnt-*.txt
 perf-*.txt
 
 examples/jeopardy/results.txt
+
+.cproject
+.project
