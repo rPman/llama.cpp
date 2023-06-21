@@ -23,9 +23,15 @@
 #include <unistd.h>
 #elif defined (_WIN32)
 #define WIN32_LEAN_AND_MEAN
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <windows.h>
 #include <signal.h>
+#endif
+
+#if defined(_MSC_VER)
+#pragma warning(disable: 4244 4267) // possible loss of data
 #endif
 
 static console_state con_st;
@@ -81,6 +87,9 @@ int main(int argc, char ** argv) {
     if (params.n_ctx > 2048) {
         fprintf(stderr, "%s: warning: model does not support context sizes greater than 2048 tokens (%d specified);"
                 "expect poor results\n", __func__, params.n_ctx);
+    } else if (params.n_ctx < 8) {
+        fprintf(stderr, "%s: warning: minimum context size is 8, using minimum size.\n", __func__);
+        params.n_ctx = 8;
     }
 
     fprintf(stderr, "%s: build = %d (%s)\n", __func__, BUILD_NUMBER, BUILD_COMMIT);
@@ -96,8 +105,7 @@ int main(int argc, char ** argv) {
         params.prompt = gpt_random_prompt(rng);
     }
 
-//    params.prompt = R"(// this function checks if the number n is prime
-//bool is_prime(int n) {)";
+    llama_init_backend();
 
     llama_context * ctx;
     g_ctx = &ctx;
@@ -135,6 +143,13 @@ int main(int argc, char ** argv) {
         return 0;
     }
 
+    // export the cgraph and exit
+    if (params.export_cgraph) {
+        llama_eval_export(ctx, "llama.ggml");
+        llama_free(ctx);
+
+        return 0;
+    }
 
     std::string path_session = params.path_prompt_cache;
     std::vector<llama_token> session_tokens;
@@ -203,6 +218,13 @@ int main(int argc, char ** argv) {
         }
     }
 
+    // if we will use the cache for the full prompt without reaching the end of the cache, force
+    // reevaluation of the last token token to recalculate the cached logits
+    if (!embd_inp.empty() && n_matching_session_tokens == embd_inp.size() &&
+            session_tokens.size() > embd_inp.size()) {
+        session_tokens.resize(embd_inp.size() - 1);
+    }
+
     // number of tokens to keep when resetting context
     if (params.n_keep < 0 || params.n_keep > (int) embd_inp.size() || params.instruct) {
         params.n_keep = (int)embd_inp.size();
@@ -218,8 +240,8 @@ int main(int argc, char ** argv) {
         params.antiprompt.push_back("### Instruction:\n\n");
     }
 
-    // enable interactive mode if reverse prompt or interactive start is specified
-    if (params.antiprompt.size() != 0 || params.interactive_first) {
+    // enable interactive mode if interactive start is specified
+    if (params.interactive_first) {
         params.interactive = true;
     }
 
@@ -251,7 +273,7 @@ int main(int argc, char ** argv) {
         sigint_action.sa_flags = 0;
         sigaction(SIGINT, &sigint_action, NULL);
 #elif defined (_WIN32)
-        auto console_ctrl_handler = [](DWORD ctrl_type) -> BOOL {
+        auto console_ctrl_handler = +[](DWORD ctrl_type) -> BOOL {
             return (ctrl_type == CTRL_C_EVENT) ? (sigint_handler(SIGINT), true) : false;
         };
         SetConsoleCtrlHandler(static_cast<PHANDLER_ROUTINE>(console_ctrl_handler), true);
@@ -302,7 +324,7 @@ int main(int argc, char ** argv) {
     }
 
     bool is_antiprompt        = false;
-    bool input_echo           = false; // initial prompt do not needed
+    bool input_echo           = true;
     bool need_to_save_session = !path_session.empty() && n_matching_session_tokens < embd_inp.size();
 
     int n_past             = 0;
@@ -315,9 +337,29 @@ int main(int argc, char ** argv) {
 
     std::vector<llama_token> embd;
 
-    while (n_remain != 0 || params.interactive) {
+    // do one empty run to warm up the model
+    {
+        const std::vector<llama_token> tmp = { llama_token_bos(), };
+        llama_eval(ctx, tmp.data(), tmp.size(), 0, params.n_threads);
+        llama_reset_timings(ctx);
+    }
+
+    while ((n_remain != 0 && !is_antiprompt) || params.interactive) {
         // predict
         if (embd.size() > 0) {
+            // Note: n_ctx - 4 here is to match the logic for commandline prompt handling via
+            // --prompt or --file which uses the same value.
+            auto max_embd_size = n_ctx - 4;
+            // Ensure the input doesn't exceed the context size by truncating embd if necessary.
+            if ((int)embd.size() > max_embd_size) {
+                auto skipped_tokens = embd.size() - max_embd_size;
+                console_set_color(con_st, CONSOLE_COLOR_ERROR);
+                printf("<<input too long: skipped %zu token%s>>", skipped_tokens, skipped_tokens != 1 ? "s" : "");
+                console_set_color(con_st, CONSOLE_COLOR_DEFAULT);
+                fflush(stdout);
+                embd.resize(max_embd_size);
+            }
+
             // infinite text generation via context swapping
             // if we run out of context:
             // - take the n_keep first tokens from the original prompt (via n_past)
@@ -404,7 +446,7 @@ int main(int argc, char ** argv) {
             const bool    penalize_nl     = params.penalize_nl;
 
             // optionally save the session on first sample (for faster prompt loading next time)
-            if (!path_session.empty() && need_to_save_session) {
+            if (!path_session.empty() && need_to_save_session && !params.prompt_cache_ro) {
                 need_to_save_session = false;
                 llama_save_session_file(ctx, path_session.c_str(), session_tokens.data(), session_tokens.size());
             }
@@ -513,9 +555,8 @@ int main(int argc, char ** argv) {
             console_set_color(con_st, CONSOLE_COLOR_DEFAULT);
         }
 
-        // in interactive mode, and not currently processing queued inputs;
-        // check if we should prompt the user for more
-        if (params.interactive && (int) embd_inp.size() <= n_consumed) {
+        // if not currently processing queued inputs;
+        if ((int) embd_inp.size() <= n_consumed) {
 
             // check for reverse prompt
             if (params.antiprompt.size()) {
@@ -526,16 +567,24 @@ int main(int argc, char ** argv) {
 
                 is_antiprompt = false;
                 // Check if each of the reverse prompts appears at the end of the output.
-                bool need_stop=false;
+                // If we're not running interactively, the reverse prompt might be tokenized with some following characters
+                // so we'll compensate for that by widening the search window a bit.
                 for (std::string & antiprompt : params.antiprompt) {
-                    if (last_output.find(antiprompt.c_str(), last_output.length() - antiprompt.length(), antiprompt.length()) != std::string::npos) {
-                        //is_interacting = true;
-                    	need_stop=true;
+                    size_t extra_padding = params.interactive ? 0 : 2;
+                    size_t search_start_pos = last_output.length() > static_cast<size_t>(antiprompt.length() + extra_padding)
+                        ? last_output.length() - static_cast<size_t>(antiprompt.length() + extra_padding)
+                        : 0;
+
+                    if (last_output.find(antiprompt.c_str(), search_start_pos) != std::string::npos) {
+                        if (params.interactive) {
+                            is_interacting = true;
+                            console_set_color(con_st, CONSOLE_COLOR_USER_INPUT);
+                        }
                         is_antiprompt = true;
+                        fflush(stdout);
                         break;
                     }
                 }
-                if(need_stop==true&&is_interacting==false) break; // exit if not in interactive mode
             }
 
             if (n_past > 0 && is_interacting) {
@@ -610,7 +659,7 @@ int main(int argc, char ** argv) {
         }
     }
 
-    if (!path_session.empty() && params.prompt_cache_all) {
+    if (!path_session.empty() && params.prompt_cache_all && !params.prompt_cache_ro) {
         fprintf(stderr, "\n%s: saving final output to session file '%s'\n", __func__, path_session.c_str());
         llama_save_session_file(ctx, path_session.c_str(), session_tokens.data(), session_tokens.size());
     }
